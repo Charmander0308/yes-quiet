@@ -1,0 +1,7 @@
+build/
+dist/
+*.spec
+__pycache__/
+# 개인 설정·기록 (이전 버전은 이 폴더에 저장했음)
+config.json
+yes-quiet.log
