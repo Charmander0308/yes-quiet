@@ -10,11 +10,13 @@ import ctypes
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import uuid
 import winreg
 from ctypes import wintypes
 from pathlib import Path
@@ -205,12 +207,38 @@ class Watcher(threading.Thread):
 
 # ---------- 화면 ----------
 
+def taskbar_identity(hwnd):
+    """작업 표시줄에 고정할 때 pythonw.exe 대신 yes-quiet(고양이 아이콘·다시 실행 명령)로 고정되게 창 속성을 붙인다."""
+    frozen = getattr(sys, "frozen", False)
+    values = {  # PKEY_AppUserModel_*(propkey.h): 5=ID, 2=RelaunchCommand, 3=RelaunchIconResource, 4=RelaunchDisplayNameResource
+        5: "yes-quiet",
+        2: f'"{sys.executable}"' if frozen else f'"{sys.executable}" "{Path(__file__).resolve()}"',
+        3: f"{sys.executable},0" if frozen else str(RES / "icon.ico"),
+        4: "yes-quiet",
+    }
+    fmtid = uuid.UUID("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3").bytes_le
+    iid = ctypes.create_string_buffer(uuid.UUID("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99").bytes_le)  # IPropertyStore
+    ctypes.windll.ole32.CoInitialize(None)
+    store = ctypes.c_void_p()
+    if ctypes.windll.shell32.SHGetPropertyStoreForWindow(wintypes.HWND(hwnd), iid, ctypes.byref(store)) != 0:
+        return  # 실패해도 아이콘만 파이썬으로 보일 뿐이라 앱은 그대로 띄운다
+    vtbl = ctypes.cast(store, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    set_value = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p)(vtbl[6])
+    for pid, text in values.items():
+        s = ctypes.create_unicode_buffer(text)
+        set_value(store, fmtid + struct.pack("<I", pid), struct.pack("<H6xQ8x", 31, ctypes.addressof(s)))  # PROPVARIANT VT_LPWSTR
+    ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p)(vtbl[7])(store)  # Commit
+    ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])(store)  # Release
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"yes-quiet {__version__}")
         self.icons = [tk.PhotoImage(file=RES / n) for n in ("icon.png", "icon-32.png")]  # make_icon.py로 생성
         self.iconphoto(True, *self.icons)
+        self.update_idletasks()  # 창이 실제로 만들어진 뒤라야 바깥 창 핸들(wm_frame)이 바뀌지 않는다
+        taskbar_identity(int(self.wm_frame(), 16))
         self.geometry("320x420")
         self.cfg = load()
         self.cfg.setdefault("toast_backup", {})
@@ -310,4 +338,6 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     import tkinter.messagebox  # noqa: F401  (on_close에서 사용)
+    # pythonw로 실행하면 작업 표시줄이 pythonw.exe 아이콘을 쓰므로, 별도 앱 ID를 줘서 창 아이콘(고양이)이 보이게 한다(추가 창도 같은 칸으로 묶임).
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("yes-quiet")
     App().mainloop()
