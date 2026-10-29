@@ -33,6 +33,15 @@ def test_is_popup():
     assert not nt.is_popup(tooltip)
 
 
+def test_face():
+    on, off = nt.face(False), nt.face(True)
+    assert on.getpixel((0, 0))[3] == 0  # 모서리는 투명
+    alphas = {a for _, (r, g, b, a) in on.getcolors(nt.SIZE ** 2)}
+    assert alphas - {0, 255}  # 가장자리 반투명이 살아 있어야 계단처럼 안 깨진다
+    assert any(r != g for _, (r, g, b, a) in on.getcolors(nt.SIZE ** 2) if a)  # ON은 컬러
+    assert all(r == g == b for _, (r, g, b, a) in off.getcolors(nt.SIZE ** 2) if a)  # OFF는 회색
+
+
 def test_toast_roundtrip():
     aumid = "NotifyToggle.SelfTest"
     nt.set_toast(aumid, False)
@@ -47,5 +56,6 @@ if __name__ == "__main__":
     test_package_family()
     test_find_aumid()
     test_is_popup()
+    test_face()
     test_toast_roundtrip()
     print("ok")

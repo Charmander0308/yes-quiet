@@ -1,2 +1,4 @@
 pycaw
+pillow
+pystray
 pyinstaller

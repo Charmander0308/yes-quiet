@@ -21,6 +21,9 @@ import winreg
 from ctypes import wintypes
 from pathlib import Path
 
+import pystray
+from PIL import Image, ImageOps
+
 __version__ = "1.0.0"
 
 # exe로 묶으면 아이콘은 임시 압축 해제 폴더(_MEIPASS)에, 설정·기록은 사용자별 %APPDATA%\yes-quiet에 둔다.
@@ -30,9 +33,28 @@ DATA.mkdir(exist_ok=True)
 CONFIG = DATA / "config.json"
 NO_WINDOW = 0x08000000
 TOAST_KEY = r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings"
+SIZE = 72  # 화면에 뜨는 고양이 크기(px)
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+gdi32 = ctypes.windll.gdi32
+
+# paint_layered에서 쓰는 함수들. 핸들이 64비트라 기본값(int)으로 주고받으면 잘린다.
+H = ctypes.c_void_p
+user32.GetDC.restype = H
+user32.GetDC.argtypes = [H]
+user32.ReleaseDC.argtypes = [H, H]
+user32.UpdateLayeredWindow.argtypes = [H, H, ctypes.POINTER(wintypes.POINT), ctypes.POINTER(wintypes.SIZE), H,
+                                       ctypes.POINTER(wintypes.POINT), wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                       wintypes.DWORD]
+gdi32.CreateCompatibleDC.restype = H
+gdi32.CreateCompatibleDC.argtypes = [H]
+gdi32.CreateBitmap.restype = H
+gdi32.CreateBitmap.argtypes = [ctypes.c_int, ctypes.c_int, wintypes.UINT, wintypes.UINT, ctypes.c_char_p]
+gdi32.SelectObject.restype = H
+gdi32.SelectObject.argtypes = [H, H]
+gdi32.DeleteObject.argtypes = [H]
+gdi32.DeleteDC.argtypes = [H]
 
 
 # ---------- 설정 파일 ----------
@@ -231,33 +253,129 @@ def taskbar_identity(hwnd):
     ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])(store)  # Release
 
 
+def face(off):
+    """화면에 띄울 고양이 그림(ON은 컬러, OFF는 회색). 가장자리 반투명까지 살린 RGBA."""
+    img = Image.open(RES / "icon.png").convert("RGBA").resize((SIZE, SIZE), Image.LANCZOS)
+    if off:
+        img = Image.merge("RGBA", (*[ImageOps.grayscale(img)] * 3, img.getchannel("A")))
+    return img
+
+
+def paint_layered(hwnd, img):
+    """창 전체를 RGBA 그림으로 칠한다(UpdateLayeredWindow).
+    색 하나를 투명하게 빼는 방식(-transparentcolor)은 가장자리가 계단처럼 깨져서, 픽셀마다 투명도를 준다."""
+    r, g, b, a = img.convert("RGBa").split()  # Windows는 알파를 미리 곱한(premultiplied) BGRA를 받는다
+    bits = Image.merge("RGBA", (b, g, r, a)).tobytes()
+    screen = user32.GetDC(None)
+    mem = gdi32.CreateCompatibleDC(screen)
+    bmp = gdi32.CreateBitmap(img.width, img.height, 1, 32, bits)
+    old = gdi32.SelectObject(mem, bmp)
+    blend = wintypes.DWORD(0x01FF0000)  # BLENDFUNCTION: AC_SRC_OVER, 불투명도 255, AC_SRC_ALPHA
+    user32.UpdateLayeredWindow(hwnd, screen, None, wintypes.SIZE(img.width, img.height), mem, wintypes.POINT(),
+                               0, blend, 2)  # ULW_ALPHA
+    gdi32.SelectObject(mem, old)
+    gdi32.DeleteObject(bmp)
+    gdi32.DeleteDC(mem)
+    user32.ReleaseDC(None, screen)
+
+
+def work_area():
+    """작업 표시줄을 뺀 화면의 오른쪽·아래 끝 좌표."""
+    r = wintypes.RECT()
+    user32.SystemParametersInfoW(0x30, 0, ctypes.byref(r), 0)  # SPI_GETWORKAREA
+    return r.right, r.bottom
+
+
+def on_screen(x, y):
+    """고양이 가운데가 어느 모니터 위에 있는지. 옮겨 둔 모니터를 뺐을 때 안 보이는 곳에 뜨는 것을 막는다."""
+    user32.MonitorFromPoint.restype = wintypes.HMONITOR
+    return bool(user32.MonitorFromPoint(wintypes.POINT(x + SIZE // 2, y + SIZE // 2), 0))  # MONITOR_DEFAULTTONULL
+
+
 class App(tk.Tk):
+    """화면에는 고양이 얼굴만 띄우고 누르면 알림 ON/OFF. 대상 앱 목록은 알림 영역 고양이를 우클릭해서 연다."""
+
     def __init__(self):
         super().__init__()
         self.title(f"yes-quiet {__version__}")
         self.icons = [tk.PhotoImage(file=RES / n) for n in ("icon.png", "icon-32.png")]  # make_icon.py로 생성
         self.iconphoto(True, *self.icons)
-        self.update_idletasks()  # 창이 실제로 만들어진 뒤라야 바깥 창 핸들(wm_frame)이 바뀌지 않는다
-        taskbar_identity(int(self.wm_frame(), 16))
-        self.geometry("320x420")
+        self.overrideredirect(True)  # 제목 표시줄·테두리 없이 고양이만
+        self.attributes("-topmost", True)
         self.cfg = load()
         self.cfg.setdefault("toast_backup", {})
+        right, bottom = work_area()
+        x, y = self.cfg.get("pos") or (right - SIZE - 16, bottom - SIZE - 16)  # 기본은 오른쪽 아래
+        if not on_screen(x, y):
+            x, y = right - SIZE - 16, bottom - SIZE - 16
+        self.geometry(f"+{x}+{y}")
+        self.faces = {"on": face(False), "off": face(True)}
+        # 보이는 그림은 paint_layered가 그리고, 이 칸은 마우스 입력만 받는다.
+        self.cat = tk.Frame(self, width=SIZE, height=SIZE, cursor="hand2")
+        self.cat.pack()
+        self.update_idletasks()
+        self.hwnd = int(self.wm_frame(), 16)
+        user32.SetWindowLongW(self.hwnd, -20, user32.GetWindowLongW(self.hwnd, -20) | 0x80000)  # GWL_EXSTYLE |= WS_EX_LAYERED
+        self.cat.bind("<ButtonPress-1>", self.press)
+        self.cat.bind("<B1-Motion>", self.drag)
+        self.cat.bind("<ButtonRelease-1>", self.release)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)  # Alt+F4로 닫을 때도 같은 확인을 거친다
         self.watcher = None
+        self.listwin = None
 
-        self.button = tk.Button(self, font=("Malgun Gothic", 20, "bold"), height=2, command=self.toggle)
-        self.button.pack(fill="x", padx=16, pady=16)
-        tk.Label(self, text="대상 앱", anchor="w").pack(fill="x", padx=16)
-        self.listbox = tk.Listbox(self, height=10)
-        self.listbox.pack(fill="both", expand=True, padx=16)
-        row = tk.Frame(self)
-        row.pack(fill="x", padx=16, pady=12)
-        tk.Button(row, text="실행 중인 앱에서 추가", command=self.add).pack(side="left")
-        tk.Button(row, text="삭제", command=self.remove).pack(side="right")
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        # 알림 영역 아이콘은 별도 스레드에서 돌므로 메뉴 동작은 after로 tk 스레드에 넘긴다.
+        self.tray = pystray.Icon("yes-quiet", Image.open(RES / "icon.png"), "yes-quiet", pystray.Menu(
+            pystray.MenuItem("대상 앱", lambda: self.after(0, self.show_list)),
+            pystray.MenuItem("종료", lambda: self.after(0, self.on_close))))
+        self.tray.run_detached()
 
         if self.cfg["state"] == "off":  # 꺼진 상태로 종료됐다면 감시를 이어서 한다
             self.start_watch()
         self.refresh()
+
+    # 누른 채 움직이면 옮기기, 그냥 눌렀다 떼면 ON/OFF.
+    def press(self, e):
+        self.drag_from = (e.x_root, e.y_root, self.winfo_x(), self.winfo_y())
+        self.moved = False
+
+    def drag(self, e):
+        sx, sy, wx, wy = self.drag_from
+        dx, dy = e.x_root - sx, e.y_root - sy
+        if self.moved or abs(dx) + abs(dy) > 4:  # 클릭할 때 손이 살짝 떨린 건 옮기기로 보지 않는다
+            self.moved = True
+            self.geometry(f"+{wx + dx}+{wy + dy}")
+
+    def release(self, e):
+        if self.moved:
+            self.cfg["pos"] = [self.winfo_x(), self.winfo_y()]
+            save(self.cfg)
+        else:
+            self.toggle()
+
+    def show_list(self):
+        if not self.listwin:
+            win = self.listwin = tk.Toplevel(self)
+            win.title(f"yes-quiet {__version__} - 대상 앱")
+            win.geometry("320x360")
+            win.update_idletasks()  # 창이 실제로 만들어진 뒤라야 바깥 창 핸들(wm_frame)이 바뀌지 않는다
+            taskbar_identity(int(win.wm_frame(), 16))
+            self.listbox = tk.Listbox(win, height=10)
+            self.listbox.pack(fill="both", expand=True, padx=16, pady=(16, 0))
+            row = tk.Frame(win)
+            row.pack(fill="x", padx=16, pady=12)
+            tk.Button(row, text="실행 중인 앱에서 추가", command=self.add).pack(side="left")
+            tk.Button(row, text="삭제", command=self.remove).pack(side="right")
+            win.protocol("WM_DELETE_WINDOW", self.close_list)
+            self.refresh()
+        # 다른 앱 창이 앞에 있으면 Windows가 앞으로 가져오기를 막으므로, 항상 위로 잠깐 올렸다 내린다.
+        self.listwin.deiconify()
+        self.listwin.attributes("-topmost", True)
+        self.listwin.attributes("-topmost", False)
+        self.listwin.focus_force()
+
+    def close_list(self):
+        self.listwin.destroy()
+        self.listwin = None
 
     def targets(self):
         return {a["process"].lower() for a in self.cfg["apps"]}
@@ -273,8 +391,9 @@ class App(tk.Tk):
             self.watcher = None
 
     def refresh(self):
-        on = self.cfg["state"] == "on"
-        self.button.config(text="알림 ON" if on else "알림 OFF", bg="#2e7d32" if on else "#9e9e9e", fg="white")
+        paint_layered(self.hwnd, self.faces[self.cfg["state"]])
+        if not self.listwin:
+            return
         self.listbox.delete(0, "end")
         for a in self.cfg["apps"]:
             self.listbox.insert("end", a["name"] + ("  (Windows 알림)" if a.get("aumid") else ""))
@@ -333,6 +452,7 @@ class App(tk.Tk):
             if not tk.messagebox.askyesno("알림 OFF 중", "닫으면 팝업 차단이 멈춥니다. 그래도 닫을까요?"):
                 return
             self.stop_watch()
+        self.tray.stop()
         self.destroy()
 
 
