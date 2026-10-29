@@ -195,17 +195,39 @@ def mute(targets, muted):
 
 
 def suppress(hwnd):
-    """팝업을 투명도 0으로 만들고 숨긴다.
+    """팝업을 투명도 0으로 만들고 숨긴다. restore에 넘길 원래 상태를 돌려준다.
     카카오톡은 팝업이 미끄러져 올라오고 내려가는 동안 창을 계속 다시 띄우므로, 숨기기만 하면 그때마다 보인다."""
     ex = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
-    if not ex & 0x80000:  # 이미 반투명 창(그림자 등)은 앱이 직접 그리므로 건드리면 깨진다. 숨기기만 한다
-        user32.SetWindowLongW(hwnd, -20, ex | 0x80000)  # WS_EX_LAYERED
-        user32.SetLayeredWindowAttributes(hwnd, 0, 0, 2)  # LWA_ALPHA, 투명도 0
+    key, alpha, flags = wintypes.DWORD(), ctypes.c_ubyte(), wintypes.DWORD()
+    if not ex & 0x80000:  # WS_EX_LAYERED
+        before = None
+        user32.SetWindowLongW(hwnd, -20, ex | 0x80000)
+    elif user32.GetLayeredWindowAttributes(hwnd, ctypes.byref(key), ctypes.byref(alpha), ctypes.byref(flags)):
+        before = (key.value, alpha.value, flags.value)  # 카카오톡 미리보기 본문은 처음부터 투명도 250인 반투명 창
+    else:
+        # 그림을 통째로 넘겨 그리는 창(카카오톡 그림자). 투명도를 정하면 앱의 다음 그리기가 막혀 계속 안 보인다
+        before = "ulw"
+    user32.SetLayeredWindowAttributes(hwnd, 0, 0, 2)  # LWA_ALPHA, 투명도 0
     user32.ShowWindow(hwnd, 0)  # SW_HIDE
+    return before
+
+
+def restore(hwnd, before):
+    """suppress 이전 상태로 되돌린다. 카카오톡은 팝업마다 창을 새로 만들지만, 창을 다시 쓰는 앱을 위해 되돌린다."""
+    if not user32.IsWindow(hwnd):
+        return
+    ex = user32.GetWindowLongW(hwnd, -20)
+    if before is None:
+        user32.SetWindowLongW(hwnd, -20, ex & ~0x80000)
+    elif before == "ulw":  # 반투명 비트를 껐다 켜야 앱이 다시 UpdateLayeredWindow로 그릴 수 있다
+        user32.SetWindowLongW(hwnd, -20, ex & ~0x80000)
+        user32.SetWindowLongW(hwnd, -20, ex | 0x80000)
+    else:
+        user32.SetLayeredWindowAttributes(hwnd, *before)
 
 
 def unsuppress(targets):
-    """suppress로 투명하게 만든 창을 되돌린다. 카카오톡은 숨긴 팝업 창을 다음 알림 때 다시 쓰므로 안 돌리면 ON에서도 안 보인다."""
+    """OFF 중에 강제 종료돼 restore를 못 한 창을 되돌린다. 원래 상태를 모르므로 투명도 0인 창의 반투명 비트만 끈다."""
     alpha, flags = ctypes.c_ubyte(), wintypes.DWORD()
     for hwnd in visible_windows(targets, {}, include_hidden=True):
         if (user32.GetLayeredWindowAttributes(hwnd, None, ctypes.byref(alpha), ctypes.byref(flags))
@@ -230,6 +252,7 @@ class Watcher(threading.Thread):
         comtypes.CoInitialize()
         cache = {}
         keep = set(visible_windows(self.targets, cache))
+        hidden = {}  # hwnd -> suppress 전 상태. 다시 숨길 때 덮어쓰지 않게 처음 값만 둔다
 
         def check(hwnd):
             if hwnd in keep:
@@ -237,7 +260,7 @@ class Watcher(threading.Thread):
             info = window_info(hwnd)
             popup = is_popup(info)
             if popup:
-                suppress(hwnd)
+                hidden.setdefault(hwnd, suppress(hwnd))
             else:
                 keep.add(hwnd)  # 채팅창 등은 한 번 판정하면 다시 보지 않는다
             with LOG.open("a", encoding="utf-8") as f:
@@ -267,8 +290,11 @@ class Watcher(threading.Thread):
                 last_mute = time.monotonic()
                 mute(self.targets, True)
                 cache.clear()  # 새로 뜬 프로세스의 pid 재사용 대비
+                for hwnd in [h for h in hidden if not user32.IsWindow(h)]:  # 닫힌 창 번호가 다른 창에 다시 쓰이기 전에 뺀다
+                    del hidden[hwnd]
         user32.UnhookWinEvent(hook)
-        unsuppress(self.targets)
+        for hwnd, before in hidden.items():
+            restore(hwnd, before)
         mute(self.targets, False)
         comtypes.CoUninitialize()
 

@@ -45,14 +45,30 @@ def test_face():
 def test_suppress_roundtrip():
     import sys
     import tkinter as tk
+    import ctypes
     r = tk.Tk()
     r.update()
     h = int(r.wm_frame(), 16)
-    nt.suppress(h)
-    assert not nt.user32.IsWindowVisible(h)
-    assert nt.user32.GetWindowLongW(h, -20) & 0x80000  # 투명도 0으로 바뀜
-    nt.unsuppress({Path(sys.executable).name.lower()})
+    alpha, flags = ctypes.c_ubyte(), ctypes.c_ulong()
+
+    def alpha_now():
+        assert nt.user32.GetLayeredWindowAttributes(h, None, ctypes.byref(alpha), ctypes.byref(flags))
+        return alpha.value
+
+    before = nt.suppress(h)  # 반투명 창이 아니었던 창
+    assert before is None and not nt.user32.IsWindowVisible(h) and alpha_now() == 0
+    nt.restore(h, before)
     assert not nt.user32.GetWindowLongW(h, -20) & 0x80000  # ON으로 돌리면 원래대로
+
+    r.attributes("-alpha", 250 / 255)  # 카카오톡 미리보기처럼 처음부터 투명도 250인 창
+    before = nt.suppress(h)
+    assert before[1] == 250 and alpha_now() == 0
+    nt.restore(h, before)
+    assert alpha_now() == 250
+
+    nt.suppress(h)  # 강제 종료로 restore를 못 했을 때
+    nt.unsuppress({Path(sys.executable).name.lower()})
+    assert not nt.user32.GetWindowLongW(h, -20) & 0x80000
     r.destroy()
 
 
