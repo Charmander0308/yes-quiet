@@ -42,6 +42,20 @@ def test_face():
     assert all(r == g == b for _, (r, g, b, a) in off.getcolors(nt.SIZE ** 2) if a)  # OFF는 회색
 
 
+def test_suppress_roundtrip():
+    import sys
+    import tkinter as tk
+    r = tk.Tk()
+    r.update()
+    h = int(r.wm_frame(), 16)
+    nt.suppress(h)
+    assert not nt.user32.IsWindowVisible(h)
+    assert nt.user32.GetWindowLongW(h, -20) & 0x80000  # 투명도 0으로 바뀜
+    nt.unsuppress({Path(sys.executable).name.lower()})
+    assert not nt.user32.GetWindowLongW(h, -20) & 0x80000  # ON으로 돌리면 원래대로
+    r.destroy()
+
+
 def test_toast_roundtrip():
     aumid = "NotifyToggle.SelfTest"
     nt.set_toast(aumid, False)
@@ -57,5 +71,6 @@ if __name__ == "__main__":
     test_find_aumid()
     test_is_popup()
     test_face()
+    test_suppress_roundtrip()
     test_toast_roundtrip()
     print("ok")

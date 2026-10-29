@@ -55,6 +55,8 @@ gdi32.SelectObject.restype = H
 gdi32.SelectObject.argtypes = [H, H]
 gdi32.DeleteObject.argtypes = [H]
 gdi32.DeleteDC.argtypes = [H]
+user32.SetWinEventHook.restype = H  # Watcher
+user32.UnhookWinEvent.argtypes = [H]
 
 
 # ---------- 설정 파일 ----------
@@ -147,12 +149,12 @@ def exe_of(pid, cache):
     return cache[pid]
 
 
-def visible_windows(targets, cache):
+def visible_windows(targets, cache, include_hidden=False):
     found = []
     proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
     def cb(hwnd, _):
-        if user32.IsWindowVisible(hwnd):
+        if include_hidden or user32.IsWindowVisible(hwnd):
             pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if exe_of(pid.value, cache) in targets:
@@ -192,6 +194,29 @@ def mute(targets, muted):
             s.SimpleAudioVolume.SetMute(1 if muted else 0, None)
 
 
+def suppress(hwnd):
+    """팝업을 투명도 0으로 만들고 숨긴다.
+    카카오톡은 팝업이 미끄러져 올라오고 내려가는 동안 창을 계속 다시 띄우므로, 숨기기만 하면 그때마다 보인다."""
+    ex = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+    if not ex & 0x80000:  # 이미 반투명 창(그림자 등)은 앱이 직접 그리므로 건드리면 깨진다. 숨기기만 한다
+        user32.SetWindowLongW(hwnd, -20, ex | 0x80000)  # WS_EX_LAYERED
+        user32.SetLayeredWindowAttributes(hwnd, 0, 0, 2)  # LWA_ALPHA, 투명도 0
+    user32.ShowWindow(hwnd, 0)  # SW_HIDE
+
+
+def unsuppress(targets):
+    """suppress로 투명하게 만든 창을 되돌린다. 카카오톡은 숨긴 팝업 창을 다음 알림 때 다시 쓰므로 안 돌리면 ON에서도 안 보인다."""
+    alpha, flags = ctypes.c_ubyte(), wintypes.DWORD()
+    for hwnd in visible_windows(targets, {}, include_hidden=True):
+        if (user32.GetLayeredWindowAttributes(hwnd, None, ctypes.byref(alpha), ctypes.byref(flags))
+                and flags.value & 2 and alpha.value == 0):
+            user32.SetWindowLongW(hwnd, -20, user32.GetWindowLongW(hwnd, -20) & ~0x80000)
+
+
+WINEVENTPROC = ctypes.WINFUNCTYPE(None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND, wintypes.LONG,
+                                  wintypes.LONG, wintypes.DWORD, wintypes.DWORD)
+
+
 class Watcher(threading.Thread):
     """OFF 순간 이미 보이던 창(메인 창 등)은 두고, 그 뒤에 새로 보이는 창만 숨긴다."""
 
@@ -205,24 +230,45 @@ class Watcher(threading.Thread):
         comtypes.CoInitialize()
         cache = {}
         keep = set(visible_windows(self.targets, cache))
-        tick = 0
-        # shortcut: 0.1초 폴링이라 팝업이 순간 깜빡일 수 있음, 거슬리면 SetWinEventHook(EVENT_OBJECT_SHOW)로 교체
-        while not self.stop_event.wait(0.1):
-            for hwnd in visible_windows(self.targets, cache):
-                if hwnd in keep:
-                    continue
-                info = window_info(hwnd)
-                popup = is_popup(info)
-                if popup:
-                    user32.ShowWindow(hwnd, 0)  # SW_HIDE
-                else:
-                    keep.add(hwnd)  # 채팅창 등은 한 번 판정하면 다시 보지 않는다
-                with LOG.open("a", encoding="utf-8") as f:
-                    f.write(f"{time.strftime('%H:%M:%S')} {'숨김' if popup else '유지'} {info}\n")
-            tick += 1
-            if tick % 10 == 0:  # 소리 세션은 앱이 처음 소리를 낼 때 생기므로 1초마다 다시 음소거
+
+        def check(hwnd):
+            if hwnd in keep:
+                return
+            info = window_info(hwnd)
+            popup = is_popup(info)
+            if popup:
+                suppress(hwnd)
+            else:
+                keep.add(hwnd)  # 채팅창 등은 한 번 판정하면 다시 보지 않는다
+            with LOG.open("a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {'숨김' if popup else '유지'} {info}\n")
+
+        def on_show(hook, event, hwnd, obj, child, thread, ms):
+            # 창이 뜨는 순간 Windows가 알려 준다(0.1초 폴링을 기다리면 그사이 팝업이 보인다). 최상위 창만 본다.
+            if not hwnd or obj != 0 or user32.GetAncestor(hwnd, 2) != hwnd:  # OBJID_WINDOW, GA_ROOT
+                return
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if exe_of(pid.value, cache) in self.targets:
+                check(hwnd)
+
+        callback = WINEVENTPROC(on_show)  # 훅이 살아 있는 동안 참조를 붙잡아 둔다
+        hook = user32.SetWinEventHook(0x8002, 0x8002, None, callback, 0, 0, 0)  # EVENT_OBJECT_SHOW, 모든 프로세스, OUTOFCONTEXT
+        msg = wintypes.MSG()
+        last_mute = 0
+        while not self.stop_event.is_set():
+            # 훅 알림은 이 스레드가 메시지를 꺼낼 때 불린다. 알림이 없어도 0.1초마다 깨어 나머지 일을 한다.
+            user32.MsgWaitForMultipleObjects(0, None, False, 100, 0x4FF)  # QS_ALLINPUT
+            while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):  # PM_REMOVE
+                user32.DispatchMessageW(ctypes.byref(msg))
+            for hwnd in visible_windows(self.targets, cache):  # 알림을 놓친 창 대비
+                check(hwnd)
+            if time.monotonic() - last_mute >= 1:  # 소리 세션은 앱이 처음 소리를 낼 때 생기므로 1초마다 다시 음소거
+                last_mute = time.monotonic()
                 mute(self.targets, True)
                 cache.clear()  # 새로 뜬 프로세스의 pid 재사용 대비
+        user32.UnhookWinEvent(hook)
+        unsuppress(self.targets)
         mute(self.targets, False)
         comtypes.CoUninitialize()
 
@@ -331,6 +377,8 @@ class App(tk.Tk):
 
         if self.cfg["state"] == "off":  # 꺼진 상태로 종료됐다면 감시를 이어서 한다
             self.start_watch()
+        else:  # OFF 중에 강제 종료됐다면 투명하게 만든 팝업 창이 남아 있으니 되돌린다
+            unsuppress(self.targets())
         self.refresh()
 
     # 누른 채 움직이면 옮기기, 그냥 눌렀다 떼면 ON/OFF.
