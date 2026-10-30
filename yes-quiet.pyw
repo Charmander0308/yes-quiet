@@ -1,15 +1,14 @@
-"""yes-quiet — 메신저 알림 일괄 ON/OFF. 앱은 끄지 않는다.
+"""yes-quiet — 메신저 알림 일괄 ON/OFF. 앱은 끄지 않는다. 지원 메신저(MESSENGERS)만 대상으로 한다.
 
 OFF 동안:
-  - 목록 앱이 새로 띄우는 창(알림 팝업)을 즉시 숨긴다. 카카오톡·텔레그램 자체 팝업용.
-  - 목록 앱의 소리를 음소거한다.
+  - 대상 메신저가 새로 띄우는 알림 팝업을 즉시 숨긴다. 카카오톡은 미리보기 창만 골라 숨긴다.
+  - 대상 메신저의 소리를 음소거한다.
   - Windows 알림(토스트)을 쓰는 앱은 Windows 알림 설정을 끈다.
 ON으로 돌리면 감시를 멈추고 소리·Windows 알림 설정을 원래대로 돌린다.
 """
 import ctypes
 import json
 import os
-import re
 import struct
 import subprocess
 import sys
@@ -73,43 +72,32 @@ def save(cfg):
 
 
 def ps(command):
+    # 출력 인코딩을 UTF-8로 맞춘다. 기본(한국어 Windows는 CP949)이면 "카카오톡" 같은 시작 메뉴 이름에서 읽기가 깨져 결과가 빈다.
+    command = "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); " + command
     return subprocess.run(["powershell", "-NoProfile", "-Command", command], capture_output=True,
                           text=True, encoding="utf-8", creationflags=NO_WINDOW).stdout
 
 
-# ---------- 앱 목록 ----------
+# ---------- 지원 메신저 ----------
 
-def package_family(path):
-    """...\\WindowsApps\\5319275A.WhatsAppDesktop_2.2639.100.0_x64__cv1g1gvanyjgm\\... -> 5319275A.WhatsAppDesktop_cv1g1gvanyjgm"""
-    m = re.search(r"\\WindowsApps\\([^\\_]+)_[^\\]*__([^\\]+)\\", path, re.I)
-    return f"{m.group(1)}_{m.group(2)}" if m else None
-
-
-def find_aumid(name, path, start_apps):
-    """Windows 알림 설정 키 이름(AppUserModelID). 스토어 앱은 패키지 이름으로, 일반 앱은 시작 메뉴 이름으로 찾는다."""
-    family = package_family(path)
-    for a in start_apps:
-        if family and a["AppID"].lower().startswith(family.lower() + "!"):
-            return a["AppID"]
-        if not family and a["Name"].lower() == name.lower():
-            return a["AppID"]
-    return None
+# name은 시작 메뉴 이름이기도 하다. toast면 그 이름으로 Windows 알림 설정 키를 찾아 OFF 때 끈다.
+# 카카오톡은 자체 팝업만 쓴다(이 PC의 Windows 알림 설정에 카카오톡 키가 없음).
+# LINE·Discord·Slack은 설치해 본 적이 없어 실행 파일 이름만 확인했다.
+MESSENGERS = [
+    {"name": "카카오톡", "process": "KakaoTalk.exe", "toast": False},
+    {"name": "Telegram", "process": "Telegram.exe", "toast": True},
+    {"name": "WhatsApp", "process": "WhatsApp.Root.exe", "toast": True},
+    {"name": "Microsoft Teams", "process": "ms-teams.exe", "toast": True},
+    {"name": "LINE", "process": "LINE.exe", "toast": True},
+    {"name": "Discord", "process": "Discord.exe", "toast": True},
+    {"name": "Slack", "process": "slack.exe", "toast": True},
+]
 
 
-def running_apps():
-    raw = ps("Get-Process | Where-Object { $_.Path -and $_.Path -notlike 'C:\\Windows\\*' } | "
-             "Select-Object ProcessName, Path -Unique | ConvertTo-Json -Compress")
-    procs = json.loads(raw or "[]")
-    procs = procs if isinstance(procs, list) else [procs]
-    start_apps = json.loads(ps("Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Compress") or "[]")
-    seen, apps = set(), []
-    for p in sorted(procs, key=lambda p: p["ProcessName"].lower()):
-        if p["ProcessName"].lower() in seen:
-            continue
-        seen.add(p["ProcessName"].lower())
-        apps.append({"name": p["ProcessName"], "process": p["ProcessName"] + ".exe",
-                     "aumid": find_aumid(p["ProcessName"], p["Path"], start_apps)})
-    return apps
+def find_aumid(name, start_apps):
+    """Windows 알림 설정 키 이름(AppUserModelID)을 시작 메뉴 이름으로 찾는다."""
+    # shortcut: 시작 메뉴 이름이 다른 판(스토어판 등)은 못 찾아 Windows 알림을 못 끈다, 실제로 생기면 이름을 더 받게 한다
+    return next((a["AppID"] for a in start_apps if a["Name"].lower() == name.lower()), None)
 
 
 # ---------- Windows 알림(토스트) 설정 ----------
@@ -168,20 +156,27 @@ def visible_windows(targets, cache, include_hidden=False):
 LOG = DATA / "yes-quiet.log"
 
 
-def window_info(hwnd):
+def window_info(hwnd, cache):
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     title = ctypes.create_unicode_buffer(200)
     user32.GetWindowTextW(hwnd, title, 200)
     cls = ctypes.create_unicode_buffer(200)
     user32.GetClassNameW(hwnd, cls, 200)
     ex = user32.GetWindowLongW(hwnd, -20) & 0xFFFFFFFF  # GWL_EXSTYLE
-    return {"title": title.value, "class": cls.value,
+    return {"exe": exe_of(pid.value, cache), "title": title.value, "class": cls.value,
             "tool": bool(ex & 0x80), "topmost": bool(ex & 0x8),
             "foreground": hwnd == user32.GetForegroundWindow()}
 
 
 def is_popup(info):
-    """알림 팝업 = 도구창(작업표시줄에 안 뜸)이거나 항상 위 창이면서, 내가 클릭해 앞으로 가져온 창이 아님.
-    채팅창은 둘 다 아니라서 남는다 (카카오톡 EVA_Window_Dblclk 채팅창으로 확인)."""
+    """알림 팝업인지 판정한다. 카카오톡은 실제 기록으로 확인한 창만 고르고, 나머지 메신저는 아직 일반 규칙을 쓴다."""
+    if info["exe"] == "kakaotalk.exe":
+        # 미리보기 본문(항상 위 + 도구 창)과 그 그림자만 숨긴다.
+        # 채팅창(항상 위로 고정해도 도구 창은 아님)·메뉴(EVA_Menu)·클릭이 통과하는 작은 창(EVA_Window)은 둔다.
+        return info["class"] == "KakaoTalkShadowWndClass" or (
+            info["class"] == "EVA_Window_Dblclk" and info["tool"] and info["topmost"])
+    # 일반 규칙: 도구 창(작업 표시줄에 안 뜸)이거나 항상 위 창이면서, 내가 클릭해 앞으로 가져온 창이 아님
     if info["class"] in ("tooltips_class32", "SysShadow", "#32768"):  # 툴팁·그림자·메뉴는 팝업 아님
         return False
     return (info["tool"] or info["topmost"]) and not info["foreground"]
@@ -257,7 +252,7 @@ class Watcher(threading.Thread):
         def check(hwnd):
             if hwnd in keep:
                 return
-            info = window_info(hwnd)
+            info = window_info(hwnd, cache)
             popup = is_popup(info)
             if popup:
                 hidden.setdefault(hwnd, suppress(hwnd))
@@ -376,6 +371,8 @@ class App(tk.Tk):
         self.attributes("-topmost", True)
         self.cfg = load()
         self.cfg.setdefault("toast_backup", {})
+        supported = {m["process"].lower() for m in MESSENGERS}
+        self.cfg["apps"] = [a for a in self.cfg["apps"] if a["process"].lower() in supported]  # 예전 판에서 고른 메신저 아닌 앱은 뺀다
         right, bottom = work_area()
         x, y = self.cfg.get("pos") or (right - SIZE - 16, bottom - SIZE - 16)  # 기본은 오른쪽 아래
         if not on_screen(x, y):
@@ -433,12 +430,11 @@ class App(tk.Tk):
             win.geometry("320x360")
             win.update_idletasks()  # 창이 실제로 만들어진 뒤라야 바깥 창 핸들(wm_frame)이 바뀌지 않는다
             taskbar_identity(int(win.wm_frame(), 16))
-            self.listbox = tk.Listbox(win, height=10)
-            self.listbox.pack(fill="both", expand=True, padx=16, pady=(16, 0))
-            row = tk.Frame(win)
-            row.pack(fill="x", padx=16, pady=12)
-            tk.Button(row, text="실행 중인 앱에서 추가", command=self.add).pack(side="left")
-            tk.Button(row, text="삭제", command=self.remove).pack(side="right")
+            tk.Label(win, text="알림을 끌 메신저").pack(anchor="w", padx=16, pady=(16, 8))
+            self.checks = {}
+            for m in MESSENGERS:
+                v = self.checks[m["process"].lower()] = tk.BooleanVar()
+                tk.Checkbutton(win, text=m["name"], variable=v, command=lambda m=m: self.pick(m)).pack(anchor="w", padx=16)
             win.protocol("WM_DELETE_WINDOW", self.close_list)
             self.refresh()
         # 다른 앱 창이 앞에 있으면 Windows가 앞으로 가져오기를 막으므로, 항상 위로 잠깐 올렸다 내린다.
@@ -468,9 +464,8 @@ class App(tk.Tk):
         paint_layered(self.hwnd, self.faces[self.cfg["state"]])
         if not self.listwin:
             return
-        self.listbox.delete(0, "end")
-        for a in self.cfg["apps"]:
-            self.listbox.insert("end", a["name"] + ("  (Windows 알림)" if a.get("aumid") else ""))
+        for process, v in self.checks.items():
+            v.set(process in self.targets())
 
     def toggle(self):
         if self.cfg["state"] == "on":
@@ -489,28 +484,16 @@ class App(tk.Tk):
         save(self.cfg)
         self.refresh()
 
-    def add(self):
-        names = {x["name"] for x in self.cfg["apps"]}
-        candidates = [a for a in running_apps() if a["name"] not in names]
-        win = tk.Toplevel(self)
-        win.title("추가할 앱 선택 (여러 개 가능)")
-        box = tk.Listbox(win, selectmode="multiple", width=40, height=20)
-        box.pack(fill="both", expand=True, padx=8, pady=8)
-        for a in candidates:
-            box.insert("end", a["name"])
-
-        def ok():
-            self.cfg["apps"] += [candidates[i] for i in box.curselection()]
-            save(self.cfg)
-            self.restart_if_off()
-            self.refresh()
-            win.destroy()
-
-        tk.Button(win, text="추가", command=ok).pack(pady=8)
-
-    def remove(self):
-        for i in reversed(self.listbox.curselection()):
-            del self.cfg["apps"][i]
+    def pick(self, m):
+        """체크하면 대상에 넣고, 풀면 뺀다. Windows 알림 설정 키는 넣을 때 한 번 찾아 둔다."""
+        process = m["process"].lower()
+        self.cfg["apps"] = [a for a in self.cfg["apps"] if a["process"].lower() != process]
+        if self.checks[process].get():
+            aumid = None
+            if m["toast"]:
+                start_apps = json.loads(ps("Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Compress") or "[]")
+                aumid = find_aumid(m["name"], start_apps)
+            self.cfg["apps"].append({"name": m["name"], "process": m["process"], "aumid": aumid})
         save(self.cfg)
         self.restart_if_off()
         self.refresh()

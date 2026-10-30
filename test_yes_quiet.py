@@ -5,32 +5,40 @@ spec = importlib.util.spec_from_file_location("nt", Path(__file__).with_name("ye
 nt = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nt)
 
-WA = r"C:\Program Files\WindowsApps\5319275A.WhatsAppDesktop_2.2639.100.0_x64__cv1g1gvanyjgm\WhatsApp.Root.exe"
+# 이 PC의 Get-StartApps 결과에서 가져온 값
 START = [{"Name": "Telegram", "AppID": "Telegram.TelegramDesktop"},
-         {"Name": "WhatsApp", "AppID": "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"}]
-
-
-def test_package_family():
-    assert nt.package_family(WA) == "5319275A.WhatsAppDesktop_cv1g1gvanyjgm"
-    assert nt.package_family(r"C:\Program Files\Kakao\KakaoTalk\KakaoTalk.exe") is None
+         {"Name": "WhatsApp", "AppID": "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"},
+         {"Name": "Microsoft Teams", "AppID": "MSTeams_8wekyb3d8bbwe!MSTeams"}]
 
 
 def test_find_aumid():
-    assert nt.find_aumid("WhatsApp.Root", WA, START) == "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"
-    assert nt.find_aumid("Telegram", r"C:\x\Telegram.exe", START) == "Telegram.TelegramDesktop"
-    assert nt.find_aumid("KakaoTalk", r"C:\Program Files\Kakao\KakaoTalk\KakaoTalk.exe", START) is None
+    assert nt.find_aumid("WhatsApp", START) == "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"
+    assert nt.find_aumid("Microsoft Teams", START) == "MSTeams_8wekyb3d8bbwe!MSTeams"
+    assert nt.find_aumid("LINE", START) is None  # 설치 안 된 앱
+
+
+def test_ps_korean():
+    assert nt.ps("Write-Output '카카오톡'").strip() == "카카오톡"  # 깨지면 시작 메뉴 목록을 못 읽는다
+
+
+def test_messengers():
+    assert len({m["process"].lower() for m in nt.MESSENGERS}) == len(nt.MESSENGERS) == 7
+    assert [m["name"] for m in nt.MESSENGERS if not m["toast"]] == ["카카오톡"]
 
 
 def test_is_popup():
     # 실제 기록(yes-quiet.log)에서 나온 창 속성들
-    kakao_chat = {"class": "EVA_Window_Dblclk", "tool": False, "topmost": False, "foreground": True}
-    kakao_popup = {"class": "EVA_Window", "tool": True, "topmost": True, "foreground": False}
-    telegram_popup = {"class": "Qt51519QWindowToolSaveBits", "tool": True, "topmost": True, "foreground": False}
-    tooltip = {"class": "tooltips_class32", "tool": True, "topmost": False, "foreground": False}
-    assert not nt.is_popup(kakao_chat)
-    assert nt.is_popup(kakao_popup)
-    assert nt.is_popup(telegram_popup)
-    assert not nt.is_popup(tooltip)
+    def win(exe, cls, tool, topmost, foreground=False):
+        return {"exe": exe, "class": cls, "tool": tool, "topmost": topmost, "foreground": foreground}
+    k = "kakaotalk.exe"
+    assert nt.is_popup(win(k, "EVA_Window_Dblclk", True, True))  # 미리보기 본문
+    assert nt.is_popup(win(k, "KakaoTalkShadowWndClass", True, True))  # 미리보기 그림자
+    assert not nt.is_popup(win(k, "EVA_Window_Dblclk", False, False, True))  # 채팅창
+    assert not nt.is_popup(win(k, "EVA_Window_Dblclk", False, True))  # 항상 위로 고정한 채팅창
+    assert not nt.is_popup(win(k, "EVA_Menu", True, True))  # 메뉴(예전 규칙은 숨겼음)
+    assert not nt.is_popup(win(k, "EVA_Window", True, True))  # 클릭이 통과하는 89x33 창(예전 규칙은 숨겼음)
+    assert nt.is_popup(win("telegram.exe", "Qt51519QWindowToolSaveBits", True, True))
+    assert not nt.is_popup(win("telegram.exe", "tooltips_class32", True, False))
 
 
 def test_face():
@@ -83,8 +91,9 @@ def test_toast_roundtrip():
 
 
 if __name__ == "__main__":
-    test_package_family()
     test_find_aumid()
+    test_ps_korean()
+    test_messengers()
     test_is_popup()
     test_face()
     test_suppress_roundtrip()
