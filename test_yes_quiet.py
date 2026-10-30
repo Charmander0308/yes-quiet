@@ -46,8 +46,8 @@ def test_face():
     assert on.getpixel((0, 0))[3] == 0  # 모서리는 투명
     alphas = {a for _, (r, g, b, a) in on.getcolors(nt.SIZE ** 2)}
     assert alphas - {0, 255}  # 가장자리 반투명이 살아 있어야 계단처럼 안 깨진다
-    assert any(r != g for _, (r, g, b, a) in on.getcolors(nt.SIZE ** 2) if a)  # ON은 컬러
-    assert all(r == g == b for _, (r, g, b, a) in off.getcolors(nt.SIZE ** 2) if a)  # OFF는 회색
+    assert off.getpixel((0, 0))[3] == 0
+    assert on.tobytes() != off.tobytes()  # ON은 낮(icon-day.png), OFF는 밤(icon-night.png)
 
 
 def test_suppress_roundtrip():

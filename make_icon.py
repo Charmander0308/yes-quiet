@@ -1,5 +1,6 @@
-"""yes-quiet 아이콘(브리티시 쇼트헤어 골드 얼굴, 이모지풍)을 PNG로 그린다. Pillow 없이 표준 라이브러리만 쓴다.
-python make_icon.py  ->  icon.png(256), icon-32.png(32)
+"""두부 아이콘(브리티시 쇼트헤어 골드 얼굴, 이모지풍)을 PNG로 그린다. Pillow 없이 표준 라이브러리만 쓴다.
+python make_icon.py  ->  icon.png(256), icon-32.png(32),
+                         icon-day.png(256, 알림 ON: 낮 하늘에 눈 뜬 두부), icon-night.png(256, 알림 OFF: 밤하늘에 자는 두부)
 """
 import math
 import struct
@@ -14,6 +15,10 @@ PINK = (240, 150, 150)
 EYE = (120, 175, 60)
 PUPIL = (40, 30, 20)
 WHITE = (255, 255, 255)
+SKY = (150, 205, 245)
+NIGHT_SKY = (44, 56, 104)
+SUN = (255, 196, 64)
+MOON = (255, 226, 140)
 
 
 # 모양은 256x256 좌표 기준 "거리 함수"(0보다 작으면 안쪽)로 정의한다.
@@ -44,6 +49,25 @@ def arc_bottom(cx, cy, rad, w):
     return lambda x, y: abs(math.hypot(x - cx, y - cy) - rad) - w if y >= cy else 99
 
 
+def sun(cx, cy, r):
+    """해: 원과 빛살 8개"""
+    rays = []
+    for deg in range(0, 360, 45):
+        c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+        rays.append(segment(cx + (r + 5) * c, cy + (r + 5) * s, cx + (r + 11) * c, cy + (r + 11) * s, 2.6))
+    return union(ellipse(cx, cy, r, r), *rays)
+
+
+def crescent(cx, cy, r):
+    """초승달: 원에서 오른쪽 위로 비킨 원을 뺀다"""
+    return lambda x, y: max(ellipse(cx, cy, r, r)(x, y), -ellipse(cx + r * 0.55, cy - r * 0.35, r * 0.85, r * 0.85)(x, y))
+
+
+def twinkle(cx, cy, s):
+    """반짝이는 별(+ 모양)"""
+    return union(segment(cx - s, cy, cx + s, cy, 1.6), segment(cx, cy - s, cx, cy + s, 1.6))
+
+
 def union(*fs):
     return lambda x, y: min(f(x, y) for f in fs)
 
@@ -68,19 +92,33 @@ LAYERS = [
     (mirror(segment, 110, 74, 114, 98, 5), GOLD_DARK),  # 이마 줄무늬
     (segment(128, 70, 128, 98, 5), GOLD_DARK),
     (union(ellipse(106, 186, 32, 24), ellipse(150, 186, 32, 24), ellipse(128, 206, 18, 12)), CREAM),  # 통통한 볼·주둥이
-    (mirror(ellipse, 82, 144, 24, 24), OUTLINE),
-    (mirror(ellipse, 82, 144, 20, 20), EYE),
-    (mirror(ellipse, 82, 145, 8, 15), PUPIL),
-    (mirror(ellipse, 75, 136, 5, 5), WHITE),
     (triangle([(116, 170), (140, 170), (128, 181)], 3), PINK),
     (segment(128, 181, 128, 189, 2), OUTLINE),
     (union(arc_bottom(119, 189, 9, 2), arc_bottom(137, 189, 9, 2)), OUTLINE),
     (mirror(segment, 20, 184, 68, 190, 1.6), OUTLINE),  # 수염
     (mirror(segment, 24, 206, 70, 200, 1.6), OUTLINE),
 ]
+EYES = [  # 눈은 다른 모양과 겹치지 않아 맨 위에 둬도 그림이 같다
+    (mirror(ellipse, 82, 144, 24, 24), OUTLINE),
+    (mirror(ellipse, 82, 144, 20, 20), EYE),
+    (mirror(ellipse, 82, 145, 8, 15), PUPIL),
+    (mirror(ellipse, 75, 136, 5, 5), WHITE),
+]
+def dim(layers, rgb=(0.80, 0.80, 0.88)):
+    """밤빛: 밝기를 낮추고 푸른 기운을 조금 남긴다. 남색을 섞으면 색이 바래 회색처럼 보여서 곱한다."""
+    return [(f, tuple(round(v * s) for v, s in zip(c, rgb))) for f, c in layers]
 
 
-def render(size, ss=3):
+CLOSED_EYES = [(mirror(arc_bottom, 82, 140, 17, 3.5), OUTLINE)]  # 감은 눈(아래로 둥근 선)
+sky = ellipse(128, 128, 127, 127)  # 머리 뒤 하늘 원. 귀 끝은 원 밖으로 나온다
+DAY = [(sky, SKY)] + LAYERS + EYES + [(grow(sun(128, 26, 11), 2.5), OUTLINE), (sun(128, 26, 11), SUN)]
+NIGHT = [(sky, NIGHT_SKY)] + dim(LAYERS + CLOSED_EYES) + [
+    (grow(crescent(126, 26, 16), 2.5), OUTLINE), (crescent(126, 26, 16), MOON),
+    (union(twinkle(96, 22, 5), twinkle(166, 14, 4)), MOON),
+]
+
+
+def render(size, layers, ss=3):
     rows = []
     for py in range(size):
         row = bytearray([0])  # PNG 줄마다 필터 바이트
@@ -90,7 +128,7 @@ def render(size, ss=3):
                 for sx in range(ss):
                     x = (px + (sx + 0.5) / ss) * 256 / size
                     y = (py + (sy + 0.5) / ss) * 256 / size
-                    for f, c in reversed(LAYERS):  # 위쪽 레이어부터 보고 처음 맞는 색
+                    for f, c in reversed(layers):  # 위쪽 레이어부터 보고 처음 맞는 색
                         if f(x, y) < 0:
                             r, g, b, a = r + c[0], g + c[1], b + c[2], a + 1
                             break
@@ -100,12 +138,12 @@ def render(size, ss=3):
     return rows
 
 
-def write_png(path, size):
+def write_png(path, size, layers):
     def chunk(kind, data):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
     ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)  # 8비트 RGBA
     Path(path).write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
-                           + chunk(b"IDAT", zlib.compress(b"".join(render(size)))) + chunk(b"IEND", b""))
+                           + chunk(b"IDAT", zlib.compress(b"".join(render(size, layers)))) + chunk(b"IEND", b""))
 
 
 def write_ico(path, pngs):
@@ -122,7 +160,9 @@ def write_ico(path, pngs):
 
 if __name__ == "__main__":
     here = Path(__file__).parent
-    write_png(here / "icon.png", 256)
-    write_png(here / "icon-32.png", 32)
+    write_png(here / "icon.png", 256, LAYERS + EYES)
+    write_png(here / "icon-32.png", 32, LAYERS + EYES)
+    write_png(here / "icon-day.png", 256, DAY)
+    write_png(here / "icon-night.png", 256, NIGHT)
     write_ico(here / "icon.ico", [here / "icon.png", here / "icon-32.png"])
     print("ok")

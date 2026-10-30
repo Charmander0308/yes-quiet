@@ -1,4 +1,4 @@
-"""yes-quiet — 메신저 알림 일괄 ON/OFF. 앱은 끄지 않는다. 지원 메신저(MESSENGERS)만 대상으로 한다.
+"""Good Night, 두부 (yes-quiet) — 메신저 알림 일괄 ON/OFF. 앱은 끄지 않는다. 지원 메신저(MESSENGERS)만 대상으로 한다.
 
 OFF 동안:
   - 대상 메신저가 새로 띄우는 알림 팝업을 즉시 숨긴다. 카카오톡은 미리보기 창만 골라 숨긴다.
@@ -21,7 +21,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 import pystray
-from PIL import Image, ImageOps
+from PIL import Image
 
 __version__ = "1.0.0"
 
@@ -297,13 +297,13 @@ class Watcher(threading.Thread):
 # ---------- 화면 ----------
 
 def taskbar_identity(hwnd):
-    """작업 표시줄에 고정할 때 pythonw.exe 대신 yes-quiet(고양이 아이콘·다시 실행 명령)로 고정되게 창 속성을 붙인다."""
+    """작업 표시줄에 고정할 때 pythonw.exe 대신 Good Night, 두부(두부 아이콘·다시 실행 명령)로 고정되게 창 속성을 붙인다."""
     frozen = getattr(sys, "frozen", False)
     values = {  # PKEY_AppUserModel_*(propkey.h): 5=ID, 2=RelaunchCommand, 3=RelaunchIconResource, 4=RelaunchDisplayNameResource
         5: "yes-quiet",
         2: f'"{sys.executable}"' if frozen else f'"{sys.executable}" "{Path(__file__).resolve()}"',
         3: f"{sys.executable},0" if frozen else str(RES / "icon.ico"),
-        4: "yes-quiet",
+        4: "Good Night, 두부",
     }
     fmtid = uuid.UUID("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3").bytes_le
     iid = ctypes.create_string_buffer(uuid.UUID("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99").bytes_le)  # IPropertyStore
@@ -321,11 +321,8 @@ def taskbar_identity(hwnd):
 
 
 def face(off):
-    """화면에 띄울 고양이 그림(ON은 컬러, OFF는 회색). 가장자리 반투명까지 살린 RGBA."""
-    img = Image.open(RES / "icon.png").convert("RGBA").resize((SIZE, SIZE), Image.LANCZOS)
-    if off:
-        img = Image.merge("RGBA", (*[ImageOps.grayscale(img)] * 3, img.getchannel("A")))
-    return img
+    """화면에 띄울 두부 얼굴(알림 ON은 낮에 깬 얼굴, OFF는 밤에 자는 얼굴). 가장자리 반투명까지 살린 RGBA."""
+    return Image.open(RES / ("icon-night.png" if off else "icon-day.png")).convert("RGBA").resize((SIZE, SIZE), Image.LANCZOS)
 
 
 def paint_layered(hwnd, img):
@@ -364,7 +361,7 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title(f"yes-quiet {__version__}")
+        self.title(f"Good Night, 두부 {__version__}")
         self.icons = [tk.PhotoImage(file=RES / n) for n in ("icon.png", "icon-32.png")]  # make_icon.py로 생성
         self.iconphoto(True, *self.icons)
         self.overrideredirect(True)  # 제목 표시줄·테두리 없이 고양이만
@@ -393,7 +390,7 @@ class App(tk.Tk):
         self.listwin = None
 
         # 알림 영역 아이콘은 별도 스레드에서 돌므로 메뉴 동작은 after로 tk 스레드에 넘긴다.
-        self.tray = pystray.Icon("yes-quiet", Image.open(RES / "icon.png"), "yes-quiet", pystray.Menu(
+        self.tray = pystray.Icon("yes-quiet", Image.open(RES / "icon.png"), "Good Night, 두부", pystray.Menu(
             pystray.MenuItem("대상 앱", lambda: self.after(0, self.show_list)),
             pystray.MenuItem("종료", lambda: self.after(0, self.on_close))))
         self.tray.run_detached()
@@ -426,7 +423,7 @@ class App(tk.Tk):
     def show_list(self):
         if not self.listwin:
             win = self.listwin = tk.Toplevel(self)
-            win.title(f"yes-quiet {__version__} - 대상 앱")
+            win.title(f"Good Night, 두부 {__version__} - 대상 앱")
             win.geometry("320x360")
             win.update_idletasks()  # 창이 실제로 만들어진 뒤라야 바깥 창 핸들(wm_frame)이 바뀌지 않는다
             taskbar_identity(int(win.wm_frame(), 16))
