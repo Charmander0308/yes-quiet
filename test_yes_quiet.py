@@ -41,6 +41,90 @@ def test_is_popup():
     assert not nt.is_popup(win("telegram.exe", "tooltips_class32", True, False))
 
 
+def test_sync_mute():
+    class Vol:
+        def __init__(self, m):
+            self.m = m
+
+        def GetMute(self):
+            return self.m
+
+        def SetMute(self, m, _):
+            self.m = m
+
+    kakao, user_muted, other = Vol(0), Vol(1), Vol(0)
+    sessions = [("kakaotalk.exe", kakao), ("telegram.exe", user_muted), ("chrome.exe", other)]
+    targets, backup, saved = {"kakaotalk.exe", "telegram.exe"}, {}, []
+
+    def save(b):
+        saved.append((dict(b), kakao.m))
+
+    nt.sync_mute(sessions, True, targets, backup, save)
+    assert (kakao.m, user_muted.m, other.m) == (1, 1, 0) and backup == {"kakaotalk.exe": 0, "telegram.exe": 1}
+    assert saved == [({"kakaotalk.exe": 0, "telegram.exe": 1}, 0)]  # 음소거하기 전에 저장
+    nt.sync_mute(sessions, True, targets, backup, save)  # 1초마다 다시 맞춰도 OFF 전 값은 그대로
+    assert backup == {"kakaotalk.exe": 0, "telegram.exe": 1} and len(saved) == 1
+    nt.sync_mute(sessions[1:], False, targets, backup, save)  # ON. 카카오톡은 종료돼 세션이 없음
+    assert user_muted.m == 1 and backup == {"kakaotalk.exe": 0}  # 볼륨 믹서에서 꺼 둔 앱은 계속 꺼 둔다
+    relaunched = Vol(1)  # 다시 켠 카카오톡 세션은 Windows가 기억한 음소거 상태로 시작한다
+    nt.sync_mute([("kakaotalk.exe", relaunched)], False, targets, backup, save)
+    assert relaunched.m == 0 and backup == {} and saved[-1][0] == {}
+
+
+def test_sound_roundtrip():
+    # 실제 소리 세션으로 확인한다. 이 파이썬으로 소리 없는 WAV를 재생하는 자식 프로세스를 대상 앱으로 삼는다.
+    import json
+    import subprocess
+    import sys
+    import tempfile
+    import time
+    from pycaw.api.audiopolicy import IAudioSessionControl2
+    from pycaw.pycaw import AudioUtilities
+    from pycaw.utils import AudioSession
+    nt.MUTE = Path(tempfile.mkdtemp()) / "mute.json"
+    exe = Path(sys.executable).name.lower()
+    child = ("import io, time, wave, winsound; b = io.BytesIO(); w = wave.open(b, 'wb'); w.setnchannels(1); "
+             "w.setsampwidth(2); w.setframerate(8000); w.writeframes(bytes(16000)); w.close(); "
+             "winsound.PlaySound(b.getvalue(), winsound.SND_MEMORY); time.sleep(1)")
+    mgr = AudioUtilities.GetAudioSessionManager()
+
+    def settles(pid, want):
+        """자식의 세션이 생긴 뒤 0.2초 안에 음소거 값이 want가 되는지. 1초마다 맞추기만으로는 대개 못 맞춘다."""
+        seen = None
+        while True:
+            e = mgr.GetSessionEnumerator()
+            for s in (AudioSession(e.GetSession(i).QueryInterface(IAudioSessionControl2)) for i in range(e.GetCount())):
+                if s.ProcessId == pid:
+                    seen = seen or time.monotonic()
+                    if s.SimpleAudioVolume.GetMute() == want:
+                        return time.monotonic() - seen < 0.2
+            if seen and time.monotonic() - seen > 1:
+                return False
+            time.sleep(0.01)
+
+    cfg = {"state": "off", "apps": [{"process": exe}]}
+    sound = nt.Sound(cfg)
+    sound.start()
+    try:
+        a = subprocess.Popen([sys.executable, "-c", child])
+        assert settles(a.pid, 1)  # OFF: 새로 생긴 세션을 바로 음소거
+        assert json.loads(nt.MUTE.read_text()) == {exe: 0}
+        a.wait()
+        cfg["state"] = "on"
+        sound.wake.set()
+        time.sleep(0.2)
+        assert json.loads(nt.MUTE.read_text()) == {exe: 0}  # 세션이 없어 못 되돌린 앱은 남겨 둔다
+        b = subprocess.Popen([sys.executable, "-c", child])
+        assert settles(b.pid, 0)  # Windows가 기억한 음소거로 시작한 세션을 바로 되돌린다
+        time.sleep(0.1)  # 되돌린 뒤에 기록을 지운다
+        assert json.loads(nt.MUTE.read_text()) == {}
+        b.wait()
+    finally:
+        sound.stop_event.set()
+        sound.wake.set()
+        sound.join(timeout=3)
+
+
 def test_face():
     on, off = nt.face(False), nt.face(True)
     assert on.getpixel((0, 0))[3] == 0  # 모서리는 투명
@@ -95,6 +179,8 @@ if __name__ == "__main__":
     test_ps_korean()
     test_messengers()
     test_is_popup()
+    test_sync_mute()
+    test_sound_roundtrip()
     test_face()
     test_suppress_roundtrip()
     test_toast_roundtrip()

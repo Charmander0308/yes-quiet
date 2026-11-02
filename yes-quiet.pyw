@@ -2,9 +2,9 @@
 
 OFF 동안:
   - 대상 메신저가 새로 띄우는 알림 팝업을 즉시 숨긴다. 카카오톡은 미리보기 창만 골라 숨긴다.
-  - 대상 메신저의 소리를 음소거한다.
+  - 대상 메신저의 소리를 음소거한다. 메신저 자체 알림음 설정은 건드리지 않으므로, 거기서 꺼 두었으면 ON이어도 소리가 안 난다.
   - Windows 알림(토스트)을 쓰는 앱은 Windows 알림 설정을 끈다.
-ON으로 돌리면 감시를 멈추고 소리·Windows 알림 설정을 원래대로 돌린다.
+ON으로 돌리면 감시를 멈추고 소리·Windows 알림 설정을 OFF 전 값으로 돌린다.
 """
 import ctypes
 import json
@@ -30,6 +30,7 @@ RES = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 DATA = Path(os.environ["APPDATA"]) / "yes-quiet"
 DATA.mkdir(exist_ok=True)
 CONFIG = DATA / "config.json"
+MUTE = DATA / "mute.json"  # 앱 -> OFF 전 음소거 값. 소리 스레드만 쓰도록 설정 파일과 나눈다
 NO_WINDOW = 0x08000000
 TOAST_KEY = r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings"
 SIZE = 72  # 화면에 뜨는 고양이 크기(px)
@@ -182,11 +183,94 @@ def is_popup(info):
     return (info["tool"] or info["topmost"]) and not info["foreground"]
 
 
-def mute(targets, muted):
-    from pycaw.pycaw import AudioUtilities
-    for s in AudioUtilities.GetAllSessions():
-        if s.Process and s.Process.name().lower() in targets:
-            s.SimpleAudioVolume.SetMute(1 if muted else 0, None)
+def sync_mute(sessions, off, targets, backup, save):
+    """소리 세션(실행 파일 이름, 볼륨) 목록의 음소거를 두부 상태에 맞추고, backup(앱 -> OFF 전 음소거 값)을 그 자리에서 고친다.
+    Windows는 앱별 음소거 값을 기억해 그 앱이 다음에 여는 세션에도 쓰므로, 세션이 없어 못 되돌린 앱은 backup에 남겨 두고 세션이 생기면 되돌린다.
+    OFF 전 값은 음소거하기 전에 save로 저장한다. 그 사이 두부가 꺼지면 다음 실행 때 음소거된 값을 원래 값으로 잘못 적는다."""
+    new = {exe: volume.GetMute() for exe, volume in sessions if off and exe in targets and exe not in backup}
+    if new:
+        backup.update(new)  # 사용자가 볼륨 믹서에서 정해 둔 값
+        save(backup)
+    restored = set()
+    for exe, volume in sessions:
+        if off and exe in targets:
+            want = 1
+        elif exe in backup:
+            want = backup[exe]
+            restored.add(exe)
+        else:
+            continue
+        if volume.GetMute() != want:
+            volume.SetMute(want, None)
+    if restored:
+        for exe in restored:
+            del backup[exe]
+        save(backup)
+
+
+class Sound(threading.Thread):
+    """대상 메신저 소리를 두부 상태에 맞춘다. 앱이 켜져 있는 동안 계속 돈다.
+    소리 세션은 메신저가 소리를 내려는 순간 생기기도 해서 1초마다 맞추면 첫 소리가 샌다. 세션이 생길 때 Windows가 알려 주면 바로 맞춘다."""
+
+    def __init__(self, cfg):
+        super().__init__(daemon=True)
+        self.cfg = cfg  # state·apps만 읽는다
+        self.wake = threading.Event()
+        self.stop_event = threading.Event()
+
+    def run(self):
+        sys.coinit_flags = 0  # 세션 생성 알림은 MTA 스레드에만 온다. comtypes는 처음 불러온 스레드를 이 값으로 초기화한다
+        import comtypes
+        from pycaw.api.audiopolicy import IAudioSessionControl2
+        from pycaw.api.mmdeviceapi import IMMDeviceEnumerator
+        from pycaw.callbacks import AudioSessionNotification
+        from pycaw.constants import CLSID_MMDeviceEnumerator
+        from pycaw.pycaw import IAudioSessionManager2
+        from pycaw.utils import AudioSession
+        comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)  # 다른 스레드가 comtypes를 먼저 불러왔을 때 대비
+        devices = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, comtypes.CLSCTX_INPROC_SERVER)
+
+        def manager():
+            # pycaw GetSpeakers와 같은 기본 출력 장치(eRender, eMultimedia). GetSpeakers는 장치 속성까지 다 읽느라 부를 때마다 CPU를 0.25초 쓴다
+            return devices.GetDefaultAudioEndpoint(0, 1).Activate(
+                IAudioSessionManager2._iid_, comtypes.CLSCTX_ALL, None).QueryInterface(IAudioSessionManager2)
+
+        def sessions():
+            e = manager().GetSessionEnumerator()
+            return [(exe_of(s.ProcessId, {}), s.SimpleAudioVolume)
+                    for s in (AudioSession(e.GetSession(i).QueryInterface(IAudioSessionControl2)) for i in range(e.GetCount()))]
+
+        wake = self.wake
+
+        class NewSession(AudioSessionNotification):
+            def on_session_created(self, new_session):
+                wake.set()
+
+        notify = NewSession()
+        try:
+            mgr = manager()
+            mgr.RegisterSessionNotification(notify)
+            mgr.GetSessionEnumerator()  # 한 번 불러야 알림이 오기 시작한다(pycaw 설명)
+        except comtypes.COMError:  # 출력 장치가 없으면 1초마다 맞추기만 한다
+            mgr = None
+        try:
+            backup = json.loads(MUTE.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            backup = {}
+        while True:
+            stopping = self.stop_event.is_set()  # 두부를 닫을 때는 OFF였어도 원래대로 돌려 둔다
+            try:
+                sync_mute(sessions(), self.cfg["state"] == "off" and not stopping,
+                          {a["process"].lower() for a in self.cfg["apps"]}, backup,
+                          lambda b: MUTE.write_text(json.dumps(b), encoding="utf-8"))
+            except comtypes.COMError:  # 출력 장치가 빠지는 중 등. 다음 차례에 다시 맞춘다
+                pass
+            if stopping:
+                break
+            self.wake.wait(1)  # 출력 장치를 바꾸면 새 장치의 세션은 알림이 안 오므로 1초마다도 맞춘다
+            self.wake.clear()
+        if mgr:
+            mgr.UnregisterSessionNotification(notify)
 
 
 def suppress(hwnd):
@@ -243,8 +327,6 @@ class Watcher(threading.Thread):
         self.stop_event = threading.Event()
 
     def run(self):
-        import comtypes
-        comtypes.CoInitialize()
         cache = {}
         keep = set(visible_windows(self.targets, cache))
         hidden = {}  # hwnd -> suppress 전 상태. 다시 숨길 때 덮어쓰지 않게 처음 값만 둔다
@@ -273,7 +355,7 @@ class Watcher(threading.Thread):
         callback = WINEVENTPROC(on_show)  # 훅이 살아 있는 동안 참조를 붙잡아 둔다
         hook = user32.SetWinEventHook(0x8002, 0x8002, None, callback, 0, 0, 0)  # EVENT_OBJECT_SHOW, 모든 프로세스, OUTOFCONTEXT
         msg = wintypes.MSG()
-        last_mute = 0
+        last_tidy = 0
         while not self.stop_event.is_set():
             # 훅 알림은 이 스레드가 메시지를 꺼낼 때 불린다. 알림이 없어도 0.1초마다 깨어 나머지 일을 한다.
             user32.MsgWaitForMultipleObjects(0, None, False, 100, 0x4FF)  # QS_ALLINPUT
@@ -281,17 +363,14 @@ class Watcher(threading.Thread):
                 user32.DispatchMessageW(ctypes.byref(msg))
             for hwnd in visible_windows(self.targets, cache):  # 알림을 놓친 창 대비
                 check(hwnd)
-            if time.monotonic() - last_mute >= 1:  # 소리 세션은 앱이 처음 소리를 낼 때 생기므로 1초마다 다시 음소거
-                last_mute = time.monotonic()
-                mute(self.targets, True)
+            if time.monotonic() - last_tidy >= 1:
+                last_tidy = time.monotonic()
                 cache.clear()  # 새로 뜬 프로세스의 pid 재사용 대비
                 for hwnd in [h for h in hidden if not user32.IsWindow(h)]:  # 닫힌 창 번호가 다른 창에 다시 쓰이기 전에 뺀다
                     del hidden[hwnd]
         user32.UnhookWinEvent(hook)
         for hwnd, before in hidden.items():
             restore(hwnd, before)
-        mute(self.targets, False)
-        comtypes.CoUninitialize()
 
 
 # ---------- 화면 ----------
@@ -388,6 +467,8 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)  # Alt+F4로 닫을 때도 같은 확인을 거친다
         self.watcher = None
         self.listwin = None
+        self.sound = Sound(self.cfg)
+        self.sound.start()
 
         # 알림 영역 아이콘은 별도 스레드에서 돌므로 메뉴 동작은 after로 tk 스레드에 넘긴다.
         self.tray = pystray.Icon("yes-quiet", Image.open(RES / "icon.png"), "Good Night, 두부", pystray.Menu(
@@ -478,6 +559,7 @@ class App(tk.Tk):
                 set_toast(aumid, value)
             self.cfg["toast_backup"] = {}
             self.cfg["state"] = "on"
+        self.sound.wake.set()
         save(self.cfg)
         self.refresh()
 
@@ -506,6 +588,9 @@ class App(tk.Tk):
             if not tk.messagebox.askyesno("알림 OFF 중", "닫으면 팝업 차단이 멈춥니다. 그래도 닫을까요?"):
                 return
             self.stop_watch()
+        self.sound.stop_event.set()
+        self.sound.wake.set()
+        self.sound.join(timeout=3)
         self.tray.stop()
         self.destroy()
 
