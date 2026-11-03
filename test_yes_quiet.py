@@ -125,6 +125,13 @@ def test_sound_roundtrip():
         sound.join(timeout=3)
 
 
+def test_already_running():
+    import os
+    name = f"Local\\yes-quiet-test-{os.getpid()}"  # 실제로 떠 있는 두부와 겹치지 않는 이름
+    assert not nt.already_running(name)
+    assert nt.already_running(name)
+
+
 def test_face():
     on, off = nt.face(False), nt.face(True)
     assert on.getpixel((0, 0))[3] == 0  # 모서리는 투명
@@ -181,6 +188,7 @@ if __name__ == "__main__":
     test_is_popup()
     test_sync_mute()
     test_sound_roundtrip()
+    test_already_running()
     test_face()
     test_suppress_roundtrip()
     test_toast_roundtrip()

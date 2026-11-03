@@ -595,7 +595,17 @@ class App(tk.Tk):
         self.destroy()
 
 
+def already_running(name="Local\\yes-quiet"):
+    """같은 Windows 로그인에서 두부가 이미 떠 있는지. 먼저 뜬 쪽이 이 이름의 뮤텍스를 끝날 때까지 쥐고 있는다."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # 그냥 GetLastError를 부르면 그사이 파이썬이 값을 덮어쓸 수 있다
+    k32.CreateMutexW.restype = H
+    k32.CreateMutexW(None, False, name)  # 핸들은 닫지 않는다. 프로세스가 끝나면 함께 풀린다
+    return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+
+
 if __name__ == "__main__":
+    if already_running():  # 두 번 띄우면 고양이가 겹치고 팝업·소리 처리가 서로 엉킨다
+        sys.exit()
     import tkinter.messagebox  # noqa: F401  (on_close에서 사용)
     # pythonw로 실행하면 작업 표시줄이 pythonw.exe 아이콘을 쓰므로, 별도 앱 ID를 줘서 창 아이콘(고양이)이 보이게 한다(추가 창도 같은 칸으로 묶임).
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("yes-quiet")
