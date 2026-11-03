@@ -23,7 +23,7 @@ from pathlib import Path
 import pystray
 from PIL import Image
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # exe로 묶으면 아이콘은 임시 압축 해제 폴더(_MEIPASS)에, 설정·기록은 사용자별 %APPDATA%\yes-quiet에 둔다.
 RES = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
