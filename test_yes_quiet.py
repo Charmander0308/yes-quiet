@@ -154,10 +154,18 @@ def test_suppress_roundtrip():
         assert nt.user32.GetLayeredWindowAttributes(h, None, ctypes.byref(alpha), ctypes.byref(flags))
         return alpha.value
 
+    def empty_region():
+        probe = nt.gdi32.CreateRectRgn(0, 0, 0, 0)
+        kind = nt.user32.GetWindowRgn(h, probe)
+        nt.gdi32.DeleteObject(probe)
+        return kind == 1  # NULLREGION
+
     before = nt.suppress(h)  # 반투명 창이 아니었던 창
     assert before is None and not nt.user32.IsWindowVisible(h) and alpha_now() == 0
+    nt.user32.SetLayeredWindowAttributes(h, 0, 229, 2)  # 카카오톡이 새 메시지 때 투명도를 다시 올려도
+    assert empty_region()  # 보이는 영역이 비어 있어 안 비친다
     nt.restore(h, before)
-    assert not nt.user32.GetWindowLongW(h, -20) & 0x80000  # ON으로 돌리면 원래대로
+    assert not nt.user32.GetWindowLongW(h, -20) & 0x80000 and not empty_region()  # ON으로 돌리면 원래대로
 
     r.attributes("-alpha", 250 / 255)  # 카카오톡 미리보기처럼 처음부터 투명도 250인 창
     before = nt.suppress(h)
@@ -167,7 +175,7 @@ def test_suppress_roundtrip():
 
     nt.suppress(h)  # 강제 종료로 restore를 못 했을 때
     nt.unsuppress({Path(sys.executable).name.lower()})
-    assert not nt.user32.GetWindowLongW(h, -20) & 0x80000
+    assert not nt.user32.GetWindowLongW(h, -20) & 0x80000 and not empty_region()
     r.destroy()
 
 

@@ -57,6 +57,9 @@ gdi32.DeleteObject.argtypes = [H]
 gdi32.DeleteDC.argtypes = [H]
 user32.SetWinEventHook.restype = H  # Watcher
 user32.UnhookWinEvent.argtypes = [H]
+gdi32.CreateRectRgn.restype = H  # suppress
+user32.SetWindowRgn.argtypes = [H, H, wintypes.BOOL]
+user32.GetWindowRgn.argtypes = [H, H]
 
 
 # ---------- 설정 파일 ----------
@@ -274,8 +277,9 @@ class Sound(threading.Thread):
 
 
 def suppress(hwnd):
-    """팝업을 투명도 0으로 만들고 숨긴다. restore에 넘길 원래 상태를 돌려준다.
-    카카오톡은 팝업이 미끄러져 올라오고 내려가는 동안 창을 계속 다시 띄우므로, 숨기기만 하면 그때마다 보인다."""
+    """팝업을 투명도 0으로 만들고, 보이는 영역을 비우고, 숨긴다. restore에 넘길 원래 상태를 돌려준다.
+    카카오톡은 팝업이 미끄러져 올라오고 내려가는 동안 창을 계속 다시 띄우므로, 숨기기만 하면 그때마다 보인다.
+    미리보기가 떠 있을 때 새 메시지가 오면 투명도까지 단계별로 다시 올리므로(51, 76, ... 229), 투명도 0만으로는 그때마다 잠깐 비친다."""
     ex = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
     key, alpha, flags = wintypes.DWORD(), ctypes.c_ubyte(), wintypes.DWORD()
     if not ex & 0x80000:  # WS_EX_LAYERED
@@ -287,6 +291,7 @@ def suppress(hwnd):
         # 그림을 통째로 넘겨 그리는 창(카카오톡 그림자). 투명도를 정하면 앱의 다음 그리기가 막혀 계속 안 보인다
         before = "ulw"
     user32.SetLayeredWindowAttributes(hwnd, 0, 0, 2)  # LWA_ALPHA, 투명도 0
+    user32.SetWindowRgn(hwnd, gdi32.CreateRectRgn(0, 0, 0, 0), True)  # 빈 영역. 넘긴 영역은 Windows가 가져가므로 지우지 않는다
     user32.ShowWindow(hwnd, 0)  # SW_HIDE
     return before
 
@@ -295,6 +300,7 @@ def restore(hwnd, before):
     """suppress 이전 상태로 되돌린다. 카카오톡은 팝업마다 창을 새로 만들지만, 창을 다시 쓰는 앱을 위해 되돌린다."""
     if not user32.IsWindow(hwnd):
         return
+    user32.SetWindowRgn(hwnd, None, True)  # shortcut: 원래 영역은 되살리지 않는다(카카오톡 미리보기는 움직일 때마다 영역을 스스로 다시 정함), 영역을 한 번만 정하는 메신저 팝업이 나오면 복사해 둔다
     ex = user32.GetWindowLongW(hwnd, -20)
     if before is None:
         user32.SetWindowLongW(hwnd, -20, ex & ~0x80000)
@@ -306,12 +312,16 @@ def restore(hwnd, before):
 
 
 def unsuppress(targets):
-    """OFF 중에 강제 종료돼 restore를 못 한 창을 되돌린다. 원래 상태를 모르므로 투명도 0인 창의 반투명 비트만 끈다."""
+    """OFF 중에 강제 종료돼 restore를 못 한 창을 되돌린다. 원래 상태를 모르므로 빈 영역을 풀고 투명도 0인 창의 반투명 비트만 끈다."""
     alpha, flags = ctypes.c_ubyte(), wintypes.DWORD()
+    probe = gdi32.CreateRectRgn(0, 0, 0, 0)
     for hwnd in visible_windows(targets, {}, include_hidden=True):
+        if user32.GetWindowRgn(hwnd, probe) == 1:  # NULLREGION
+            user32.SetWindowRgn(hwnd, None, True)
         if (user32.GetLayeredWindowAttributes(hwnd, None, ctypes.byref(alpha), ctypes.byref(flags))
                 and flags.value & 2 and alpha.value == 0):
             user32.SetWindowLongW(hwnd, -20, user32.GetWindowLongW(hwnd, -20) & ~0x80000)
+    gdi32.DeleteObject(probe)
 
 
 WINEVENTPROC = ctypes.WINFUNCTYPE(None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND, wintypes.LONG,
