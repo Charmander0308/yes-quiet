@@ -445,6 +445,14 @@ def on_screen(x, y):
     return bool(user32.MonitorFromPoint(wintypes.POINT(x + SIZE // 2, y + SIZE // 2), 0))  # MONITOR_DEFAULTTONULL
 
 
+def home(pos):
+    """두부가 있어야 할 자리. 기억해 둔 자리가 지금 연결된 모니터 위에 없으면 주 모니터 오른쪽 아래."""
+    if pos and on_screen(*pos):
+        return tuple(pos)
+    right, bottom = work_area()
+    return right - SIZE - 16, bottom - SIZE - 16
+
+
 class App(tk.Tk):
     """화면에는 고양이 얼굴만 띄우고 누르면 알림 ON/OFF. 대상 앱 목록은 알림 영역 고양이를 우클릭해서 연다."""
 
@@ -459,11 +467,7 @@ class App(tk.Tk):
         self.cfg.setdefault("toast_backup", {})
         supported = {m["process"].lower() for m in MESSENGERS}
         self.cfg["apps"] = [a for a in self.cfg["apps"] if a["process"].lower() in supported]  # 예전 판에서 고른 메신저 아닌 앱은 뺀다
-        right, bottom = work_area()
-        x, y = self.cfg.get("pos") or (right - SIZE - 16, bottom - SIZE - 16)  # 기본은 오른쪽 아래
-        if not on_screen(x, y):
-            x, y = right - SIZE - 16, bottom - SIZE - 16
-        self.geometry(f"+{x}+{y}")
+        self.geometry("+%d+%d" % home(self.cfg.get("pos")))
         self.faces = {"on": face(False), "off": face(True)}
         # 보이는 그림은 paint_layered가 그리고, 이 칸은 마우스 입력만 받는다.
         self.cat = tk.Frame(self, width=SIZE, height=SIZE, cursor="hand2")
@@ -491,11 +495,35 @@ class App(tk.Tk):
         else:  # OFF 중에 강제 종료됐다면 투명하게 만든 팝업 창이 남아 있으니 되돌린다
             unsuppress(self.targets())
         self.refresh()
+        self.dragging = False
+        self.after(3000, self.heal)
+
+    def heal(self):
+        """노트북을 닫았다 열거나 모니터를 빼고 꽂은 뒤 두부가 화면에서 사라지는 것을 막는다.
+        3초마다 자리·보임·항상 위를 확인해 어긋난 것을 고치고, 무엇이 어긋났는지 기록에 남긴다."""
+        if not self.dragging:
+            fixed = []
+            now, want = (self.winfo_x(), self.winfo_y()), home(self.cfg.get("pos"))
+            if max(abs(now[0] - want[0]), abs(now[1] - want[1])) > 2:
+                self.geometry("+%d+%d" % want)
+                fixed.append(f"자리 {now} -> {want}")
+            if not user32.IsWindowVisible(self.hwnd):
+                self.deiconify()
+                fixed.append("숨겨져 있었음")
+            if not user32.GetWindowLongW(self.hwnd, -20) & 0x8:  # WS_EX_TOPMOST
+                self.attributes("-topmost", True)
+                fixed.append("항상 위가 풀려 있었음")
+            paint_layered(self.hwnd, self.faces[self.cfg["state"]])  # 그림만 날아간 경우는 알아챌 방법이 없어 매번 다시 그린다
+            if fixed:
+                with LOG.open("a", encoding="utf-8") as f:
+                    f.write(f"{time.strftime('%m-%d %H:%M:%S')} 두부 복구 {fixed}\n")
+        self.after(3000, self.heal)
 
     # 누른 채 움직이면 옮기기, 그냥 눌렀다 떼면 ON/OFF.
     def press(self, e):
         self.drag_from = (e.x_root, e.y_root, self.winfo_x(), self.winfo_y())
         self.moved = False
+        self.dragging = True
 
     def drag(self, e):
         sx, sy, wx, wy = self.drag_from
@@ -505,6 +533,7 @@ class App(tk.Tk):
             self.geometry(f"+{wx + dx}+{wy + dy}")
 
     def release(self, e):
+        self.dragging = False
         if self.moved:
             self.cfg["pos"] = [self.winfo_x(), self.winfo_y()]
             save(self.cfg)
