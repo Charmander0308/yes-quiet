@@ -158,6 +158,18 @@ def visible_windows(targets, cache, include_hidden=False):
 
 
 LOG = DATA / "yes-quiet.log"
+LOG_MAX = 1_000_000  # 바이트. 넘으면 yes-quiet.log.1로 넘기고 새로 쓴다(이전 것 하나만 남김)
+
+
+def log(text):
+    """두부가 어떤 창을 숨기거나 남겼는지 적는다. 새 메신저의 팝업 규칙을 정할 때 창 정보를 보는 용도."""
+    try:
+        if LOG.stat().st_size > LOG_MAX:
+            LOG.replace(LOG.with_name(LOG.name + ".1"))
+    except FileNotFoundError:
+        pass
+    with LOG.open("a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%m-%d %H:%M:%S')} {text}\n")
 
 
 def window_info(hwnd, cache):
@@ -346,12 +358,13 @@ class Watcher(threading.Thread):
                 return
             info = window_info(hwnd, cache)
             popup = is_popup(info)
+            first = hwnd not in hidden  # 카카오톡 미리보기는 움직이는 동안 수십 번 다시 뜨므로 창마다 처음 한 번만 적는다
             if popup:
                 hidden.setdefault(hwnd, suppress(hwnd))
             else:
                 keep.add(hwnd)  # 채팅창 등은 한 번 판정하면 다시 보지 않는다
-            with LOG.open("a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%H:%M:%S')} {'숨김' if popup else '유지'} {info}\n")
+            if first:
+                log(f"{'숨김' if popup else '유지'} {info}")
 
         def on_show(hook, event, hwnd, obj, child, thread, ms):
             # 창이 뜨는 순간 Windows가 알려 준다(0.1초 폴링을 기다리면 그사이 팝업이 보인다). 최상위 창만 본다.
@@ -515,8 +528,7 @@ class App(tk.Tk):
                 fixed.append("항상 위가 풀려 있었음")
             paint_layered(self.hwnd, self.faces[self.cfg["state"]])  # 그림만 날아간 경우는 알아챌 방법이 없어 매번 다시 그린다
             if fixed:
-                with LOG.open("a", encoding="utf-8") as f:
-                    f.write(f"{time.strftime('%m-%d %H:%M:%S')} 두부 복구 {fixed}\n")
+                log(f"두부 복구 {fixed}")
         self.after(3000, self.heal)
 
     # 누른 채 움직이면 옮기기, 그냥 눌렀다 떼면 ON/OFF.

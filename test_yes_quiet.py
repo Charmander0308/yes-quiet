@@ -201,3 +201,22 @@ if __name__ == "__main__":
     test_suppress_roundtrip()
     test_toast_roundtrip()
     print("ok")
+
+
+def test_log_rotate():
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    old_log, old_max = nt.LOG, nt.LOG_MAX
+    nt.LOG, nt.LOG_MAX = d / "yes-quiet.log", 100
+    try:
+        nt.log("첫 줄")
+        assert nt.LOG.read_text(encoding="utf-8").endswith("첫 줄\n")
+        nt.LOG.write_text("x" * 200, encoding="utf-8")  # 한도를 넘기면
+        nt.log("새 줄")
+        assert (d / "yes-quiet.log.1").read_text(encoding="utf-8") == "x" * 200  # 이전 것은 .1로
+        assert nt.LOG.read_text(encoding="utf-8").count("\n") == 1  # 새 파일에 한 줄만
+        nt.LOG.write_text("y" * 200, encoding="utf-8")
+        nt.log("또")
+        assert (d / "yes-quiet.log.1").read_text(encoding="utf-8") == "y" * 200  # .1은 하나만 남는다
+    finally:
+        nt.LOG, nt.LOG_MAX = old_log, old_max
