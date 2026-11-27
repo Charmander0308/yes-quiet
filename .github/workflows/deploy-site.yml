@@ -1,0 +1,19 @@
+name: deploy yeseong.site
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Vercel Deploy Hook
+        env:
+          HOOK: ${{ secrets.YESEONG_SITE_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "YESEONG_SITE_DEPLOY_HOOK secret 이 없습니다."
+            exit 1
+          fi
+          curl -fsS -X POST "$HOOK"
